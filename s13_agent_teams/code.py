@@ -20,9 +20,16 @@ Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
     .worktrees/   optional task-bound working directories
 """
 
-import fcntl
 import json
 import os
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    if os.name == "nt":
+        import msvcrt
+
 import random
 import re
 import secrets
@@ -67,6 +74,28 @@ teammate_assignments: dict[str, dict[str, object]] = {}
 assignment_versions: dict[str, int] = {}
 
 
+def _acquire_file_lock(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    else:
+        import msvcrt
+        handle.seek(0)
+        if handle.read(1) == b"":
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _release_file_lock(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    else:
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 @contextmanager
 def task_store_lock():
     """Serialize task mutations across threads and host processes."""
@@ -74,8 +103,8 @@ def task_store_lock():
         depth = getattr(_task_store_state, "depth", 0)
         if depth == 0:
             TASKS_DIR.mkdir(parents=True, exist_ok=True)
-            handle = TASK_LOCK_PATH.open("a+")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle = TASK_LOCK_PATH.open("a+b")
+            _acquire_file_lock(handle)
             _task_store_state.handle = handle
         _task_store_state.depth = depth + 1
         try:
@@ -84,7 +113,7 @@ def task_store_lock():
             _task_store_state.depth -= 1
             if _task_store_state.depth == 0:
                 handle = _task_store_state.handle
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                _release_file_lock(handle)
                 handle.close()
                 del _task_store_state.handle
 
@@ -1752,12 +1781,21 @@ def wait_for_cli_event() -> tuple[str, str | None]:
         if not prompt_visible:
             print("s13 >> ", end="", flush=True)
             prompt_visible = True
-        readable, _, _ = select.select([sys.stdin], [], [], 0.25)
-        if readable:
-            line = sys.stdin.readline()
-            if line == "":
-                return "quit", None
-            return "user", line.rstrip("\n")
+        if os.name == "nt":
+            import msvcrt
+            if msvcrt.kbhit():
+                line = sys.stdin.readline()
+                if line == "":
+                    return "quit", None
+                return "user", line.rstrip("\n")
+            time.sleep(0.05)
+        else:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.25)
+            if readable:
+                line = sys.stdin.readline()
+                if line == "":
+                    return "quit", None
+                return "user", line.rstrip("\n")
 
 
 if __name__ == "__main__":
